@@ -53,3 +53,4 @@ Please refer to details in the original project page: [Domainbed](https://github
 
 ```
 
+Please contact me via email (liangchen527@gmail.com) if your have any questions regarding this project.
