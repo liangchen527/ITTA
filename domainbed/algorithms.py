@@ -81,7 +81,7 @@ class Algorithm(torch.nn.Module):
 
 class ITTA(Algorithm):
     """
-    Improved Test time style consistent (ITTA)
+    Improved Test-Time Adaptation (ITTA)
     """
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
