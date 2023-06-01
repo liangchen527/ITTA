@@ -12,7 +12,6 @@ import json
 import os
 import random
 import sys
-sys.path.append("/apdcephfs/share_1290939/liamclchen/dg/TSC_DomainBed_v7/")
 import numpy as np
 import tqdm
 
