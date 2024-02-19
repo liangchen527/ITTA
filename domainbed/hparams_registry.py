@@ -62,6 +62,10 @@ def _hparams(algorithm, dataset, random_seed):
         else:
             _hparam('ada_lr', 1e-6, lambda r: 10**r.uniform(-6, -6))
 
+    elif algorithm in ['RIDG']:
+        _hparam('momentum', 0.001, lambda r: 10**r.uniform(-4, -1))
+        _hparam('ridg_reg', 0.01, lambda r: 10**r.uniform(-2, -1))
+
     elif algorithm == "RSC":
         _hparam('rsc_f_drop_factor', 1/3, lambda r: r.uniform(0, 0.5))
         _hparam('rsc_b_drop_factor', 1/3, lambda r: r.uniform(0, 0.5))
