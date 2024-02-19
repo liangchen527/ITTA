@@ -45,7 +45,8 @@ ALGORITHMS = [
     'TRM',
     'IB_ERM',
     'IB_IRM',
-    'ITTA'
+    'ITTA',
+    'RIDG'
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -179,6 +180,60 @@ class ITTA(Algorithm):
         z_ori = self.test_mapping.fea4(z_ori)
         z_ori = self.featurizer.flat(z_ori)
         return self.classifier(z_ori)
+
+class RIDG(Algorithm):
+    """
+    Rational Invariance for Domain Generalization (RIDG)
+    """
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(RIDG, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+	self.classifier = networks.Classifier(
+	    self.featurizer.n_outputs,
+	    num_classes,
+	    self.hparams['nonlinear_classifier'])
+	self.network = nn.Sequential(self.featurizer, self.classifier)
+	self.num_classes = num_classes
+	self.rational_bank = torch.zeros(num_classes, num_classes, self.featurizer.n_outputs, device='cuda')
+	self.init = torch.ones(num_classes, device='cuda')
+	self.optimizer = torch.optim.Adam(
+	    self.network.parameters(),
+	    lr=self.hparams["lr"],
+	    weight_decay=self.hparams['weight_decay'])
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x,y in minibatches])
+	all_y = torch.cat([y for x,y in minibatches])
+	features = self.featurizer(all_x)
+	logits = self.predict(all_x)
+	rational = torch.zeros(self.num_classes, all_x.shape[0], self.featurizer.n_outputs, device='cuda')
+	for i in range(self.num_classes):
+	    rational[i] = (self.classifier.weight[i] * features)
+
+	classes = torch.unique(all_y)
+	loss_rational = 0
+	for i in range(classes.shape[0]):
+	    rational_mean = rational[:, all_y==classes[i]].mean(dim=1)
+	    if self.init[classes[i]]:
+	        self.rational_bank[classes[i]] = rational_mean
+		self.init[classes[i]] = False
+	    else:
+		self.rational_bank[classes[i]] = (1 - self.hparams['momentum']) * self.rational_bank[classes[i]] + \
+						self.hparams['momentum'] * rational_mean
+	    loss_rational += ((rational[:, all_y==classes[i]] - (self.rational_bank[classes[i]].unsqueeze(1)).detach())**2).sum(dim=2).mean()
+	loss = F.cross_entropy(logits, all_y)
+	loss += self.hparams['ridg_reg'] * loss_rational
+
+	self.optimizer.zero_grad()
+	loss.backward()
+	self.optimizer.step()
+
+	return {'loss': loss.item()}
+
+    def predict(self, x):
+	z = self.featurizer(x)
+	return self.classifier(z)
 
 class ERM(Algorithm):
     """
