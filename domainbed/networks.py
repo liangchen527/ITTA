@@ -376,6 +376,22 @@ def Featurizer(input_shape, hparams):
         return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError
+    
+def Featurizer_OTHMix(input_shape, hparams, part='trunk'):
+    if input_shape[1:3] == (224, 224):
+        if part == 'base':
+            return ResNet_base(input_shape, hparams)
+        elif part == 'trunk':
+            return ResNet_trunk(input_shape, hparams)
+        else:
+            raise NotImplementedError
+    else:
+        if part == 'base':
+            return MNIST_base(input_shape)
+        elif part == 'trunk':
+            return MNIST_trunk(input_shape)
+        else:
+            raise NotImplementedError
 
 
 def Classifier(in_features, out_features, is_nonlinear=False):
@@ -409,3 +425,143 @@ class WholeFish(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+###########################################
+class ResNet_base(torch.nn.Module):
+    """ResNet with the softmax chopped off and the batchnorm frozen"""
+    def __init__(self, input_shape, hparams):
+        super(ResNet_base, self).__init__()
+        if hparams['resnet18']:
+            self.network = torchvision.models.resnet18(pretrained=True)
+            self.n_outputs = 512
+        else:
+            self.network = torchvision.models.resnet18(pretrained=True)
+            self.n_outputs = 2048
+
+        # self.network = remove_batch_norm_from_resnet(self.network)
+
+        # adapt number of channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.network.conv1.weight.data.clone()
+
+            self.network.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7),
+                stride=(2, 2), padding=(3, 3), bias=False)
+
+            for i in range(nc):
+                self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # save memory
+        del self.network.fc
+        del self.network.layer2
+        del self.network.layer3
+        del self.network.layer4
+        del self.network.avgpool
+
+        self.freeze_bn()
+        self.hparams = hparams
+        self.dropout = nn.Dropout(hparams['resnet_dropout'])
+
+    def forward(self, x):
+        """Encode x into a feature vector of size n_outputs."""
+        x = self.network.conv1(x)
+        x = self.network.bn1(x)
+        x = self.network.relu(x)
+        x = self.network.maxpool(x)
+
+        x = self.network.layer1(x)
+        # x = self.network.layer2(x)
+        # x = self.network.layer3(x)
+        # x = self.network.layer4(x)
+        #
+        # x = self.network.avgpool(x)
+        # x = torch.flatten(x, 1)
+        # x = self.network.fc(x)
+
+        return x
+
+    def train(self, mode=True):
+        """
+        Override the default train() to freeze the BN parameters
+        """
+        super().train(mode)
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.network.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+
+class ResNet_trunk(torch.nn.Module):
+    """ResNet with the softmax chopped off and the batchnorm frozen"""
+    def __init__(self, input_shape, hparams):
+        super(ResNet_trunk, self).__init__()
+        if hparams['resnet18']:
+            self.network = torchvision.models.resnet18(pretrained=True)
+            self.n_outputs = 512
+        else:
+            self.network = torchvision.models.resnet18(pretrained=True)
+            self.n_outputs = 2048
+
+        # self.network = remove_batch_norm_from_resnet(self.network)
+
+        # adapt number of channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.network.conv1.weight.data.clone()
+
+            self.network.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7),
+                stride=(2, 2), padding=(3, 3), bias=False)
+
+            for i in range(nc):
+                self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # save memory
+        del self.network.fc
+        self.network.fc = Identity()
+
+        del self.network.conv1
+        del self.network.bn1
+        del self.network.relu
+        del self.network.maxpool
+        del self.network.layer1
+        #del self.network.layer2
+        #del self.network.layer3
+
+        self.freeze_bn()
+        self.hparams = hparams
+        self.dropout = nn.Dropout(hparams['resnet_dropout'])
+
+    def forward(self, x):
+        """Encode x into a feature vector of size n_outputs."""
+        # x = self.network.conv1(x)
+        # x = self.network.bn1(x)
+        # x = self.network.relu(x)
+        # x = self.network.maxpool(x)
+        #
+        # x = self.network.layer1(x)
+        x = self.network.layer2(x)
+        x = self.network.layer3(x)
+        x = self.network.layer4(x)
+
+        x = self.network.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.network.fc(x)
+        x = self.dropout(x)
+
+        return x
+
+    def train(self, mode=True):
+        """
+        Override the default train() to freeze the BN parameters
+        """
+        super().train(mode)
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.network.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()

@@ -15,6 +15,7 @@ except:
     backpack = None
 
 from domainbed import networks
+from domainbed import HSIC
 from domainbed.lib.misc import (
     random_pairs_of_minibatches, ParamDict, MovingAverage, l2_between_dicts
 )
@@ -46,7 +47,8 @@ ALGORITHMS = [
     'IB_ERM',
     'IB_IRM',
     'ITTA',
-    'RIDG'
+    'RIDG',
+    'CauseEB'
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -79,6 +81,124 @@ class Algorithm(torch.nn.Module):
     def predict(self, x):
         raise NotImplementedError
 
+
+class CauseEB(Algorithm):
+    """
+        A Causal Inspired Early-Branching Structure for Domain Generalization
+    """
+    
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CauseEB, self).__init__(input_shape, num_classes, num_domains,
+                                   hparams)
+        self.eps = 1e-6
+        self.MSEloss = nn.MSELoss()
+        self.base = networks.Featurizer_OTHMix(input_shape, self.hparams, 'base')
+        self.featurizer_domains = networks.Featurizer_OTHMix(input_shape, self.hparams)
+        self.classifier_domains = networks.MLP(self.featurizer_domains.n_outputs,
+                                               num_domains, self.hparams)
+        self.featurizer_class = networks.Featurizer_OTHMix(input_shape, self.hparams)
+        self.classifier_class = networks.Classifier(
+            self.featurizer_class.n_outputs,
+            num_classes,
+            self.hparams['nonlinear_classifier'])
+        
+        input_feat_size = self.featurizer_class.n_outputs
+        hidden_size = input_feat_size if input_feat_size == 2048 else input_feat_size * 2
+        self.cdpl = nn.Sequential(
+            nn.Linear(input_feat_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size, input_feat_size),
+            nn.BatchNorm1d(input_feat_size)
+        )
+        
+        self.optimizer = torch.optim.Adam([
+            {'params': self.base.parameters()},
+            {'params': self.featurizer_domains.parameters()},
+            {'params': self.classifier_domains.parameters()},
+            {'params': self.featurizer_class.parameters()},
+            {'params': self.classifier_class.parameters()}
+        ], lr=self.hparams["lr"],
+            weight_decay=self.hparams['weight_decay']
+        )
+        
+    def rds(self, x):
+        def sam(var):
+            var = var.squeeze().squeeze()
+            mean = var.mean(0)
+            X = var - mean
+            cov = torch.mm(X.t(), X) / len(X)
+            cov += 0.0001 * torch.eye(len(mean), device='cuda')
+            new_dis = torch.distributions.multivariate_normal.MultivariateNormal(
+                mean, covariance_matrix=cov)
+            negative_samples = new_dis.rsample((10000,))
+            prob_density = new_dis.log_prob(negative_samples)
+            cur_samples, index_prob = torch.topk(- prob_density, var.shape[0])
+            ood_samples = negative_samples[index_prob]
+            return ood_samples.unsqueeze(-1).unsqueeze(-1)
+        
+        mu = x.mean(dim=[2, 3], keepdim=True)
+        var = x.var(dim=[2, 3], keepdim=True)
+        sig = (var + self.eps).sqrt()
+        mu, sig = mu.detach(), sig.detach()
+        x_normed = (x - mu) / sig
+        mu2, sig2 = sam(mu), sam(sig)
+        return x_normed * sig2 + mu2
+    
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][0].is_cuda else "cpu"
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        domains_labels = torch.cat([
+            torch.full((x.shape[0],), i, dtype=torch.int64, device=device)
+            for i, (x, y) in enumerate(minibatches)
+        ])
+        all_x_inter = self.base(all_x)
+        mix_x_inter = self.rds(all_x_inter)
+        
+        mix_z_class = self.featurizer_class(mix_x_inter)
+        mix_z_class_normalized = F.normalize(mix_z_class, p=2, dim=1)
+        mix_z_domains = self.featurizer_domains(mix_x_inter)
+        mix_z_domains_normalized = F.normalize(mix_z_domains, p=2, dim=1)
+        
+        z_class = self.featurizer_class(all_x_inter)
+        z_domains = self.featurizer_domains(all_x_inter)
+        z_class_normalized = F.normalize(z_class, p=2, dim=1)
+        z_domains_normalized = F.normalize(z_domains, p=2, dim=1)
+        
+        ############## compute losses
+        loss_domains = F.cross_entropy(self.classifier_domains(z_domains), domains_labels)
+        loss_class = F.cross_entropy(self.classifier_class(z_class), all_y)
+        loss_class_mix = F.cross_entropy(self.classifier_class(mix_z_class), all_y)
+        
+        oth_loss1 = HSIC(z_class_normalized, z_domains_normalized.detach())
+        oth_loss2 = HSIC(z_class_normalized, mix_z_domains_normalized.detach())
+        oth_loss3 = HSIC(mix_z_class_normalized, z_domains_normalized.detach())
+        oth_loss4 = HSIC(mix_z_class_normalized, mix_z_domains_normalized.detach())
+        
+        sim_loss = self.MSEloss(z_class, self.cdpl(mix_z_class))
+        sim_loss_mix = self.MSEloss(mix_z_class, self.cdpl(z_class))
+        m1 = torch.abs(z_domains - self.cdpl(mix_z_domains)).square().mean(-1).max()
+        m2 = torch.abs(mix_z_domains - self.cdpl(z_domains)).square().mean(-1).max()
+        dissim_domain_loss1 = min([self.MSEloss(z_domains, self.cdpl(mix_z_domains)) - m1, 0])
+        dissim_domain_loss2 = min([self.MSEloss(mix_z_domains, self.cdpl(z_domains)) - m2, 0])
+        
+        loss_main = loss_class + loss_class_mix + loss_domains
+        loss_cons = sim_loss + sim_loss_mix - dissim_domain_loss1 - dissim_domain_loss2
+        loss_indp = oth_loss1 + oth_loss2 + oth_loss3 + oth_loss4
+        
+        loss = loss_main + self.hparams['beta'] * loss_cons + self.hparams['alpha'] * loss_indp
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        return {'loss_class': loss_class.item(), 'loss_domains': loss_domains.item()}
+    
+    def predict(self, x):
+        return self.classifier_class(self.featurizer_class(self.base(x)))
 
 class ITTA(Algorithm):
     """
