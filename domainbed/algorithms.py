@@ -48,7 +48,9 @@ ALGORITHMS = [
     'IB_IRM',
     'ITTA',
     'RIDG',
-    'CauseEB'
+    'CauseEB',
+    'LFME',
+    'ERMPlus'	
 ]
 
 def get_algorithm_class(algorithm_name):
@@ -80,6 +82,82 @@ class Algorithm(torch.nn.Module):
 
     def predict(self, x):
         raise NotImplementedError
+
+class ERMPlus(ERM):
+    " A Free Lunch for DG, introduced in LFME "
+	
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(ERMPlus, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        logits = self.predict(all_x)
+        loss_ce = F.cross_entropy(logits, all_y)
+
+        all_y_one_hot = F.one_hot(all_y, num_classes=logits.shape[1]).float()
+        loss_mse = F.mse_loss(logits, all_y_one_hot)
+
+        loss = loss_ce + self.hparams['ermplus']*loss_mse
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {'loss': loss.item()}
+
+
+class LFME(Algorithm):
+    """
+    Learning from Multiple Experts for Domain Generalization
+    """
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(LFME, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.MSEloss = nn.MSELoss()
+        self.expert_number = num_domains + 1
+        self.num_classes = num_classes
+        self.featurizer = [None] * self.expert_number
+        self.classifier = [None] * self.expert_number
+        self.network = [None] * self.expert_number
+        self.optimizer = [None] * self.expert_number
+        device = 'cuda' #or 'cpu'
+        for i in range(self.expert_number):
+            self.featurizer[i] = networks.Featurizer(input_shape, self.hparams).to(device)
+            self.classifier[i] = networks.Classifier(self.featurizer[i].n_outputs,
+                num_classes,self.hparams['nonlinear_classifier']).to(device)
+            self.network[i] = nn.Sequential(self.featurizer[i], self.classifier[i])
+            self.optimizer[i] = torch.optim.Adam(
+                self.network[i].parameters(),
+                lr=self.hparams["lr"],
+                weight_decay=self.hparams['weight_decay']
+                )
+			
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
+        expert = torch.zeros(all_y.shape[0], self.num_classes).to('cuda')
+        for i in range(self.expert_number-1):
+            mmbatch = minibatches[i]
+            part_x, part_y = mmbatch[0], mmbatch[1]
+            result_expert = self.network[i](part_x)
+            loss = F.cross_entropy(result_expert, part_y)
+            self.optimizer[i].zero_grad()
+            loss.backward()
+            self.optimizer[i].step()
+            index, end = (i) * part_y.shape[0], (i + 1) * part_y.shape[0]
+            expert[index:end, :] = F.softmax(result_expert, dim=1)
+
+        result_target = self.network[-1](all_x)
+        loss_cla = F.cross_entropy(result_target, all_y)
+        loss_guid = self.MSEloss(result_target, expert.detach())
+        loss = loss_cla + loss_guid * self.hparams['lfe_reg']
+        self.optimizer[-1].zero_grad()
+        loss.backward()
+        self.optimizer[-1].step()
+        return {'loss': loss.item()}
+
+    def predict(self, x):
+       return self.network[-1](x)
 
 
 class CauseEB(Algorithm):
