@@ -56,6 +56,12 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm == 'Fish':
         _hparam('meta_lr', 0.5, lambda r:r.choice([0.05, 0.1, 0.5]))
 
+    elif algorithm == 'ERMPlus':
+        _hparam('ermplus', 1.0, lambda r: 10**r.uniform(-2, 1))
+
+    elif algorithm == 'LFME':
+        _hparam('lfe_reg', 1.0, lambda r: 10**r.uniform(-2, 1))
+
     elif algorithm == 'ITTA':
         if dataset == 'DomainNet':
             _hparam('ada_lr', 0.1, lambda r: 10**r.uniform(-1, -1))
